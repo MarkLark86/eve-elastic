@@ -1,6 +1,5 @@
 from typing import Dict
 
-import asyncio
 import ast
 import types
 import arrow
@@ -343,7 +342,7 @@ def set_filters(query, filters):
 
 def set_sort(query, sort):
     query["sort"] = []
-    for (key, sortdir) in sort:
+    for key, sortdir in sort:
         sort_dict = dict([(key, "asc" if sortdir > 0 else "desc")])
         query["sort"].append(sort_dict)
 
@@ -417,7 +416,9 @@ class Elastic(DataLayer):
                     )
                     raise
 
-    async def _init_index(self, es: elasticsearch.AsyncElasticsearch, index, settings=None, mapping=None):
+    async def _init_index(
+        self, es: elasticsearch.AsyncElasticsearch, index, settings=None, mapping=None
+    ):
         if not await es.indices.exists(index):
             await self._create_index_from_alias(es, index, settings)
         elif settings:
@@ -460,7 +461,9 @@ class Elastic(DataLayer):
         elif schema["type"] == "integer":
             return {"type": "integer"}
 
-    async def _create_index_from_alias(self, es: elasticsearch.AsyncElasticsearch, alias, settings=None):
+    async def _create_index_from_alias(
+        self, es: elasticsearch.AsyncElasticsearch, alias, settings=None
+    ):
         """Create new index and ignore if it exists already."""
         try:
             index = generate_index_name(alias)
@@ -470,7 +473,9 @@ class Elastic(DataLayer):
         except elasticsearch.TransportError:  # index exists
             pass
 
-    async def _create_index(self, es: elasticsearch.AsyncElasticsearch, index, settings=None):
+    async def _create_index(
+        self, es: elasticsearch.AsyncElasticsearch, index, settings=None
+    ):
         args = {"index": index, "body": {}}
         if settings:
             args["body"].update(settings)
@@ -522,7 +527,9 @@ class Elastic(DataLayer):
         properties["properties"].pop("_id", None)
         return properties
 
-    async def _put_mapping(self, es: elasticsearch.AsyncElasticsearch, index, mapping=None):
+    async def _put_mapping(
+        self, es: elasticsearch.AsyncElasticsearch, index, mapping=None
+    ):
         if mapping:
             await es.indices.put_mapping(index=index, body=fix_mapping(mapping))
 
@@ -736,7 +743,9 @@ class Elastic(DataLayer):
 
             try:
                 args["size"] = 1
-                hits = await self.elastic(resource).search(body=fix_query(query), **args)
+                hits = await self.elastic(resource).search(
+                    body=fix_query(query), **args
+                )
                 docs = self._parse_hits(hits, resource)
                 return docs.first()
             except elasticsearch.NotFoundError:
@@ -778,7 +787,9 @@ class Elastic(DataLayer):
                 query = {"query": {"bool": {"must": [{"term": {"_id": _id}}]}}}
                 try:
                     args["size"] = 1
-                    hits = await self.elastic(resource).search(body=fix_query(query), **args)
+                    hits = await self.elastic(resource).search(
+                        body=fix_query(query), **args
+                    )
                     docs = self._parse_hits(hits, resource)
                     return docs.first()
                 except elasticsearch.NotFoundError:
@@ -828,7 +839,9 @@ class Elastic(DataLayer):
             if doc.get("_id"):
                 action["_id"] = doc["_id"]
             actions.append(action)
-        res = await async_bulk(self.elastic(resource), actions, stats_only=False, **kwargs)
+        res = await async_bulk(
+            self.elastic(resource), actions, stats_only=False, **kwargs
+        )
         await self._refresh_resource_index(resource)
         return res
 
@@ -881,7 +894,9 @@ class Elastic(DataLayer):
         :param resource: resource name
         """
         args = self._es_args(resource)
-        res = await self.elastic(resource).count(body={"query": {"match_all": {}}}, **args)
+        res = await self.elastic(resource).count(
+            body={"query": {"match_all": {}}}, **args
+        )
         return res.get("count", 0) == 0
 
     async def put_settings(self, resource, settings=None):
@@ -905,7 +920,9 @@ class Elastic(DataLayer):
         index = self._resource_index(resource)
         await self._put_settings(es, index, settings)
 
-    async def _put_settings(self, es: elasticsearch.AsyncElasticsearch, index, settings):
+    async def _put_settings(
+        self, es: elasticsearch.AsyncElasticsearch, index, settings
+    ):
         await es.indices.close(index=index)
         await es.indices.put_settings(index=index, body=settings)
         await es.indices.open(index=index)
@@ -990,7 +1007,9 @@ class Elastic(DataLayer):
         :param resource: resource name
         """
         if self._resource_config(resource, "FORCE_REFRESH", True) or force:
-            await self.elastic(resource).indices.refresh(index=self._resource_index(resource))
+            await self.elastic(resource).indices.refresh(
+                index=self._resource_index(resource)
+            )
 
     def _resource_prefix(self, resource=None):
         """Get elastic prefix for given resource.

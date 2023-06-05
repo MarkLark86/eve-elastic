@@ -27,4 +27,4 @@ jobs:
           ./scripts/wait-for-elastic.sh
 
     - name: test
-      run: nosetests
+      run: pytest
