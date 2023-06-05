@@ -1,3 +1,6 @@
+from typing import Dict
+
+import asyncio
 import ast
 import types
 import arrow
@@ -7,10 +10,10 @@ import logging
 import elasticsearch
 
 from bson import ObjectId
-from elasticsearch.helpers import bulk, reindex
+from elasticsearch.helpers import async_bulk, async_reindex
 
 from uuid import uuid4
-from flask import request, abort, json, current_app as app
+from quart import request, abort, json, current_app as app
 from eve.utils import config
 from eve.io.base import DataLayer
 from eve.io.mongo.parser import parse, ParseError
@@ -284,9 +287,22 @@ class ElasticCursor(object):
         """Parse hits into docs."""
         self.hits = hits if hits else self.no_hits
         self.docs = docs if docs else []
+        self._async_iter_index = 0
 
     def __getitem__(self, key):
         return self.docs[key]
+
+    def __aiter__(self):
+        self._async_iter_index = 0
+        return self
+
+    async def __anext__(self):
+        if self._async_iter_index >= len(self.docs):
+            raise StopAsyncIteration
+
+        doc = self.docs[self._async_iter_index]
+        self._async_iter_index += 1
+        return doc
 
     def first(self):
         """Get first doc."""
@@ -332,14 +348,14 @@ def set_sort(query, sort):
         query["sort"].append(sort_dict)
 
 
-def get_es(url, **kwargs):
+def get_es(url, **kwargs) -> elasticsearch.AsyncElasticsearch:
     """Create elasticsearch client instance.
 
     :param url: elasticsearch url
     """
     urls = [url] if isinstance(url, str) else url
     kwargs.setdefault("serializer", ElasticJSONSerializer())
-    es = elasticsearch.Elasticsearch(urls, **kwargs)
+    es = elasticsearch.AsyncElasticsearch(urls, **kwargs)
     return es
 
 
@@ -351,6 +367,8 @@ class Elastic(DataLayer):
     """ElasticSearch data layer."""
 
     serializers = {"integer": int, "datetime": parse_date, "objectid": ObjectId}
+    es: elasticsearch.AsyncElasticsearch
+    elastics: Dict[str, elasticsearch.AsyncElasticsearch]
 
     def __init__(self, app=None, **kwargs):
         """Let user specify extra arguments for Elasticsearch"""
@@ -376,7 +394,12 @@ class Elastic(DataLayer):
         self.index = app.config["ELASTICSEARCH_INDEX"]
         self.es = get_es(app.config["ELASTICSEARCH_URL"], **self.kwargs)
 
-    def init_index(self):
+    async def destroy_app(self):
+        await self.es.close()
+        for es in self.elastics.values():
+            await es.close()
+
+    async def init_index(self):
         """Create indexes and put mapping."""
         for resource in self._get_elastic_resources():
             es = self.elastic(resource)
@@ -384,7 +407,7 @@ class Elastic(DataLayer):
             settings = self._resource_config(resource, "SETTINGS")
             mappings = self._resource_mapping(resource)
             try:
-                self._init_index(es, index, settings, mappings)
+                await self._init_index(es, index, settings, mappings)
             except elasticsearch.exceptions.RequestError:
                 if app.config.get("DEBUG"):
                     raise
@@ -394,13 +417,13 @@ class Elastic(DataLayer):
                     )
                     raise
 
-    def _init_index(self, es, index, settings=None, mapping=None):
-        if not es.indices.exists(index):
-            self._create_index_from_alias(es, index, settings)
+    async def _init_index(self, es: elasticsearch.AsyncElasticsearch, index, settings=None, mapping=None):
+        if not await es.indices.exists(index):
+            await self._create_index_from_alias(es, index, settings)
         elif settings:
-            self._put_settings(es, index, settings)
+            await self._put_settings(es, index, settings)
         if mapping:
-            self._put_mapping(es, index, mapping)
+            await self._put_mapping(es, index, mapping)
 
     def get_datasource(self, resource):
         return getattr(self, "_datasource", self.datasource)(resource)
@@ -437,21 +460,21 @@ class Elastic(DataLayer):
         elif schema["type"] == "integer":
             return {"type": "integer"}
 
-    def _create_index_from_alias(self, es, alias, settings=None):
+    async def _create_index_from_alias(self, es: elasticsearch.AsyncElasticsearch, alias, settings=None):
         """Create new index and ignore if it exists already."""
         try:
             index = generate_index_name(alias)
-            self._create_index(es, index, settings)
-            es.indices.put_alias(index, alias)
+            await self._create_index(es, index, settings)
+            await es.indices.put_alias(index, alias)
             logger.info("created index alias=%s index=%s" % (alias, index))
         except elasticsearch.TransportError:  # index exists
             pass
 
-    def _create_index(self, es, index, settings=None):
+    async def _create_index(self, es: elasticsearch.AsyncElasticsearch, index, settings=None):
         args = {"index": index, "body": {}}
         if settings:
             args["body"].update(settings)
-        es.indices.create(**args)
+        await es.indices.create(**args)
 
     def _get_elastic_resources(self):
         elastic_resources = {}
@@ -499,34 +522,34 @@ class Elastic(DataLayer):
         properties["properties"].pop("_id", None)
         return properties
 
-    def _put_mapping(self, es, index, mapping=None):
+    async def _put_mapping(self, es: elasticsearch.AsyncElasticsearch, index, mapping=None):
         if mapping:
-            es.indices.put_mapping(index=index, body=fix_mapping(mapping))
+            await es.indices.put_mapping(index=index, body=fix_mapping(mapping))
 
-    def get_mapping(self, resource):
+    async def get_mapping(self, resource):
         """Get mapping for resource.
 
         :param resource: resource name
         """
         index = self._resource_index(resource)
-        mapping = self.elastic(resource).indices.get_mapping(index=index)
+        mapping = await self.elastic(resource).indices.get_mapping(index=index)
         return next(iter(mapping.values()))
 
-    def get_settings(self, resource):
+    async def get_settings(self, resource):
         """Get settings for resource.
 
         :param resource: resource name
         """
         index = self._resource_index(resource)
-        settings = self.elastic(resource).indices.get_settings(index=index)
+        settings = await self.elastic(resource).indices.get_settings(index=index)
         return next(iter(settings.values()))
 
-    def get_index(self, resource):
+    async def get_index(self, resource):
         alias = self._resource_index(resource)
-        info = self.elastic(resource).indices.get_alias(name=alias)
+        info = await self.elastic(resource).indices.get_alias(name=alias)
         return next(iter(info.keys()))
 
-    def get_index_by_alias(self, alias):
+    async def get_index_by_alias(self, alias):
         """Get index name for given alias.
 
         If there is no alias assume it's an index.
@@ -534,7 +557,7 @@ class Elastic(DataLayer):
         :param alias: alias name
         """
         try:
-            info = self.es.indices.get_alias(name=alias)
+            info = await self.es.indices.get_alias(name=alias)
             return next(iter(info.keys()))
         except elasticsearch.exceptions.NotFoundError:
             return alias
@@ -543,7 +566,7 @@ class Elastic(DataLayer):
         """Return default search arguments"""
         return {"track_total_hits": self.app.config["ELASTICSEARCH_TRACK_TOTAL_HITS"]}
 
-    def find(self, resource, req, sub_resource_lookup, **kwargs):
+    async def find(self, resource, req, sub_resource_lookup, **kwargs):
         """Find documents for resource."""
         args = getattr(req, "args", request.args if request else {}) or {}
         source_config = app.config["DOMAIN"][resource]["datasource"]
@@ -633,7 +656,7 @@ class Elastic(DataLayer):
         args = default_params
 
         try:
-            hits = self.elastic(resource).search(body=fix_query(query), **args)
+            hits = await self.elastic(resource).search(body=fix_query(query), **args)
         except elasticsearch.exceptions.RequestError as e:
             if e.status_code == 400 and "No mapping found for" in e.error:
                 hits = {}
@@ -698,10 +721,10 @@ class Elastic(DataLayer):
             )[2]
             return ",".join([key for key, val in projection.items() if val])
 
-    def find_one(self, resource, req, **lookup):
+    async def find_one(self, resource, req, **lookup):
         """Find single document, if there is _id in lookup use that, otherwise filter."""
         if config.ID_FIELD in lookup:
-            return self._find_by_id(
+            return await self._find_by_id(
                 resource=resource,
                 _id=lookup[config.ID_FIELD],
                 parent=lookup.get("parent"),
@@ -713,13 +736,13 @@ class Elastic(DataLayer):
 
             try:
                 args["size"] = 1
-                hits = self.elastic(resource).search(body=fix_query(query), **args)
+                hits = await self.elastic(resource).search(body=fix_query(query), **args)
                 docs = self._parse_hits(hits, resource)
                 return docs.first()
             except elasticsearch.NotFoundError:
                 return
 
-    def _find_by_id(self, resource, _id, parent=None):
+    async def _find_by_id(self, resource, _id, parent=None):
         """Find the document by Id. If parent is not provided then on
         routing exception try to find using search.
         """
@@ -735,7 +758,7 @@ class Elastic(DataLayer):
             if parent:
                 args["parent"] = parent
 
-            hit = self.elastic(resource).get(id=_id, **args)
+            hit = await self.elastic(resource).get(id=_id, **args)
 
             if not is_found(hit):
                 return
@@ -755,30 +778,30 @@ class Elastic(DataLayer):
                 query = {"query": {"bool": {"must": [{"term": {"_id": _id}}]}}}
                 try:
                     args["size"] = 1
-                    hits = self.elastic(resource).search(body=fix_query(query), **args)
+                    hits = await self.elastic(resource).search(body=fix_query(query), **args)
                     docs = self._parse_hits(hits, resource)
                     return docs.first()
                 except elasticsearch.NotFoundError:
                     return
 
-    def find_one_raw(self, resource, _id):
+    async def find_one_raw(self, resource, _id):
         """Find document by id."""
-        return self._find_by_id(resource=resource, _id=_id)
+        return await self._find_by_id(resource=resource, _id=_id)
 
-    def find_list_of_ids(self, resource, ids, client_projection=None):
+    async def find_list_of_ids(self, resource, ids, client_projection=None):
         """Find documents by ids."""
         args = self._es_args(resource)
         return self._parse_hits(
-            self.elastic(resource).mget(body={"ids": ids}, **args), resource
+            await self.elastic(resource).mget(body={"ids": ids}, **args), resource
         )
 
-    def find_by_id(self, _id, resources):
+    async def find_by_id(self, _id, resources):
         for resource in resources:
-            doc = self._find_by_id(resource, _id)
+            doc = await self._find_by_id(resource, _id)
             if doc:
                 return doc
 
-    def insert(self, resource, doc_or_docs, **kwargs):
+    async def insert(self, resource, doc_or_docs, **kwargs):
         """Insert document, it must be new if there is ``_id`` in it."""
         ids = []
         es_args = self._es_args(resource)
@@ -786,13 +809,13 @@ class Elastic(DataLayer):
         for doc in doc_or_docs:
             _id = doc.pop("_id", None)
             body = self._prepare_for_storage(resource, doc, es_args)
-            res = self.elastic(resource).index(body=body, id=_id, **es_args)
+            res = await self.elastic(resource).index(body=body, id=_id, **es_args)
             doc.setdefault("_id", res.get("_id", _id))
             ids.append(doc.get("_id"))
-        self._refresh_resource_index(resource)
+        await self._refresh_resource_index(resource)
         return ids
 
-    def bulk_insert(self, resource, docs, **kwargs):
+    async def bulk_insert(self, resource, docs, **kwargs):
         """Bulk insert documents."""
         kwargs.update(self._es_args(resource))
         parent_type = self._get_parent_type(resource)
@@ -805,23 +828,23 @@ class Elastic(DataLayer):
             if doc.get("_id"):
                 action["_id"] = doc["_id"]
             actions.append(action)
-        res = bulk(self.elastic(resource), actions, stats_only=False, **kwargs)
-        self._refresh_resource_index(resource)
+        res = await async_bulk(self.elastic(resource), actions, stats_only=False, **kwargs)
+        await self._refresh_resource_index(resource)
         return res
 
-    def update(self, resource, id_, updates):
+    async def update(self, resource, id_, updates):
         """Update document in index."""
         args = self._es_args(resource, refresh=True)
         if self._get_retry_on_conflict():
             args["retry_on_conflict"] = self._get_retry_on_conflict()
         doc = self._prepare_for_storage(resource, updates, args)
-        return self.elastic(resource).update(id=id_, body={"doc": doc}, **args)
+        return await self.elastic(resource).update(id=id_, body={"doc": doc}, **args)
 
-    def replace(self, resource, id_, document):
+    async def replace(self, resource, id_, document):
         """Replace document in index."""
         args = self._es_args(resource, refresh=True)
         doc = self._prepare_for_storage(resource, document, args)
-        return self.elastic(resource).index(body=doc, id=id_, **args)
+        return await self.elastic(resource).index(body=doc, id=id_, **args)
 
     def _prepare_for_storage(self, resource, data, args):
         doc = data.copy()
@@ -831,7 +854,7 @@ class Elastic(DataLayer):
         self._update_parent_args(resource, args, doc)
         return doc
 
-    def remove(self, resource, lookup=None, parent=None, **kwargs):
+    async def remove(self, resource, lookup=None, parent=None, **kwargs):
         """Remove docs for resource.
 
         :param resource: resource name
@@ -845,23 +868,23 @@ class Elastic(DataLayer):
         if lookup:
             if lookup.get("_id"):
                 try:
-                    return self.elastic(resource).delete(
+                    return await self.elastic(resource).delete(
                         id=lookup.get("_id"), refresh=True, **kwargs
                     )
                 except elasticsearch.NotFoundError:
                     return
         return ValueError("there must be `lookup._id` specified")
 
-    def is_empty(self, resource):
+    async def is_empty(self, resource):
         """Test if there is no document for resource.
 
         :param resource: resource name
         """
         args = self._es_args(resource)
-        res = self.elastic(resource).count(body={"query": {"match_all": {}}}, **args)
+        res = await self.elastic(resource).count(body={"query": {"match_all": {}}}, **args)
         return res.get("count", 0) == 0
 
-    def put_settings(self, resource, settings=None):
+    async def put_settings(self, resource, settings=None):
         """Modify index settings.
 
         Index must exist already.
@@ -870,7 +893,7 @@ class Elastic(DataLayer):
             return
 
         try:
-            old_settings = self.get_settings(resource)
+            old_settings = await self.get_settings(resource)
             if test_settings_contain(
                 old_settings["settings"]["index"], settings["settings"]
             ):
@@ -880,12 +903,12 @@ class Elastic(DataLayer):
 
         es = self.elastic(resource)
         index = self._resource_index(resource)
-        self._put_settings(es, index, settings)
+        await self._put_settings(es, index, settings)
 
-    def _put_settings(self, es, index, settings):
-        es.indices.close(index=index)
-        es.indices.put_settings(index=index, body=settings)
-        es.indices.open(index=index)
+    async def _put_settings(self, es: elasticsearch.AsyncElasticsearch, index, settings):
+        await es.indices.close(index=index)
+        await es.indices.put_settings(index=index, body=settings)
+        await es.indices.open(index=index)
 
     def _parse_hits(self, hits, resource):
         """Parse hits response into documents."""
@@ -961,13 +984,13 @@ class Elastic(DataLayer):
         )
         return indexes.get(datasource[0], default_index)
 
-    def _refresh_resource_index(self, resource, force=False):
+    async def _refresh_resource_index(self, resource, force=False):
         """Refresh index for given resource.
 
         :param resource: resource name
         """
         if self._resource_config(resource, "FORCE_REFRESH", True) or force:
-            self.elastic(resource).indices.refresh(self._resource_index(resource))
+            await self.elastic(resource).indices.refresh(index=self._resource_index(resource))
 
     def _resource_prefix(self, resource=None):
         """Get elastic prefix for given resource.
@@ -984,7 +1007,7 @@ class Elastic(DataLayer):
         px = self._resource_prefix(resource)
         return app.config.get("%s_%s" % (px, key), default)
 
-    def elastic(self, resource):
+    def elastic(self, resource) -> elasticsearch.AsyncElasticsearch:
         """Get ElasticSearch instance for given resource."""
         px = self._resource_prefix(resource)
 
@@ -999,20 +1022,20 @@ class Elastic(DataLayer):
         """Get the retry on settings"""
         return app.config.get("ELASTICSEARCH_RETRY_ON_CONFLICT", 5)
 
-    def drop_index(self):
+    async def drop_index(self):
         for resource in self._get_elastic_resources():
             try:
                 alias = self._resource_index(resource)
-                alias_info = self.elastic(resource).indices.get_alias(name=alias)
+                alias_info = await self.elastic(resource).indices.get_alias(name=alias)
                 for index in alias_info:
-                    self.elastic(resource).indices.delete(index)
+                    await self.elastic(resource).indices.delete(index)
             except elasticsearch.exceptions.NotFoundError:
                 try:
-                    self.elastic(resource).indices.delete(alias)
+                    await self.elastic(resource).indices.delete(alias)
                 except elasticsearch.exceptions.NotFoundError:
                     pass
 
-    def search(self, query, resources, params=None):
+    async def search(self, query, resources, params=None):
         """Search multiple resources at the same time.
 
         They must use all same elastic instance and should be same schema.
@@ -1029,44 +1052,44 @@ class Elastic(DataLayer):
             resources = resources.split(",")
         index = [self._resource_index(resource) for resource in resources]
         try:
-            hits = self.elastic(resources[0]).search(
+            hits = await self.elastic(resources[0]).search(
                 body=fix_query(query), index=index, **params
             )
             return self._parse_hits(hits, resources[0])
         except elasticsearch.exceptions.RequestError:
             raise
 
-    def reindex(self, resource):
+    async def reindex(self, resource):
         es = self.elastic(resource)
         alias = self._resource_index(resource)
         settings = self._resource_config(resource, "SETTINGS")
         mapping = self._resource_mapping(resource)
-        old_index = self.get_index(resource)
+        old_index = await self.get_index(resource)
 
         # create new index
         index = generate_index_name(alias)
         print("create", index)
-        self._create_index(es, index, settings)
-        self._put_mapping(es, index, mapping)
+        await self._create_index(es, index, settings)
+        await self._put_mapping(es, index, mapping)
 
         # reindex data
         print("reindex", alias, index)
-        reindex(es, alias, index)
+        await async_reindex(es, alias, index)
 
         # remove old alias
         print("remove alias", alias, old_index)
-        es.indices.delete_alias(index=old_index, name=alias)
+        await es.indices.delete_alias(index=old_index, name=alias)
 
         # remove old index
         print("remove index", old_index)
-        es.indices.delete(old_index)
+        await es.indices.delete(old_index)
 
         # create alias for new index
         print("put", alias, index)
-        es.indices.put_alias(index=index, name=alias)
+        await es.indices.put_alias(index=index, name=alias)
 
         print("refresh", index)
-        es.indices.refresh(index)
+        await es.indices.refresh(index=index)
 
 
 def build_elastic_query(doc):

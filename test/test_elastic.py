@@ -3,15 +3,15 @@
 import eve
 import time
 import elasticsearch
-from unittest import TestCase, skip
+from unittest import skip, IsolatedAsyncioTestCase
 from datetime import datetime
 from copy import deepcopy
-from flask import json
+from quart import json
 from eve.utils import config, ParsedRequest, parse_request
 from eve_elastic.elastic import parse_date, Elastic, get_es, generate_index_name
-from nose.tools import raises
+from pytest import raises
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 
 def highlight_callback(query_string):
@@ -140,19 +140,25 @@ INDEX = "elastic_tests"
 DOC_TYPE = "items"
 
 
-class TestElastic(TestCase):
-    def setUp(self):
+class TestElastic(IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
         settings = {"DOMAIN": DOMAIN}
         settings["ELASTICSEARCH_URL"] = "http://localhost:9200"
         settings["ELASTICSEARCH_INDEX"] = INDEX
         settings["FOO_URL"] = settings["ELASTICSEARCH_URL"]
         settings["FOO_INDEX"] = "foo"
         settings["DEBUG"] = True
-        self.es = elasticsearch.Elasticsearch([settings["ELASTICSEARCH_URL"]])
+        self.es = elasticsearch.AsyncElasticsearch([settings["ELASTICSEARCH_URL"]])
         self.app = eve.Eve(settings=settings, data=Elastic)
-        with self.app.app_context():
-            self.app.data.drop_index()
-            self.app.data.init_index()
+        await self.app.init_resources()
+        async with self.app.app_context():
+            await self.app.data.drop_index()
+            await self.app.data.init_index()
+
+    async def asyncTearDown(self):
+        await self.es.close()
+        await self.app.data.destroy_app()
+        del self.app
 
     def test_parse_date(self):
         date = parse_date("2013-11-06T07:56:01.414944+00:00")
@@ -166,9 +172,9 @@ class TestElastic(TestCase):
     def test_generate_index_name(self):
         self.assertNotEqual(generate_index_name("a"), generate_index_name("a"))
 
-    def test_get_mapping(self):
-        with self.app.app_context():
-            mapping = self.app.data.get_mapping("items")
+    async def test_get_mapping(self):
+        async with self.app.app_context():
+            mapping = await self.app.data.get_mapping("items")
 
         items_mapping = mapping["mappings"]["properties"]
 
@@ -191,21 +197,21 @@ class TestElastic(TestCase):
         self.assertIn("created", place_mapping["properties"])
         self.assertEqual("date", place_mapping["properties"]["created"]["type"])
 
-    def test_dates_are_parsed_on_fetch(self):
-        with self.app.app_context():
-            ids = self.app.data.insert(
+    async def test_dates_are_parsed_on_fetch(self):
+        async with self.app.app_context():
+            ids = await self.app.data.insert(
                 "items", [{"uri": "test", "firstcreated": "2012-10-10T11:12:13+0000"}]
             )
-            self.app.data.update(
+            await self.app.data.update(
                 "published_items", ids[0], {"published": "2012-10-10T12:12:13+0000"}
             )
-            item = self.app.data.find_one("published_items", req=None, uri="test")
+            item = await self.app.data.find_one("published_items", req=None, uri="test")
             self.assertIsInstance(item["firstcreated"], datetime)
             self.assertIsInstance(item["published"], datetime)
 
-    def test_bulk_insert(self):
-        with self.app.app_context():
-            (count, _errors) = self.app.data.bulk_insert(
+    async def test_bulk_insert(self):
+        async with self.app.app_context():
+            (count, _errors) = await self.app.data.bulk_insert(
                 "items_with_description",
                 [
                     {
@@ -229,12 +235,12 @@ class TestElastic(TestCase):
                     },
                 ],
             )
-            self.assertEquals(3, count)
-            self.assertEquals(0, len(_errors))
+            self.assertEqual(3, count)
+            self.assertEqual(0, len(_errors))
 
-    def test_query_filter_with_filter_dsl_and_schema_filter(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_query_filter_with_filter_dsl_and_schema_filter(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [
                     {
@@ -258,81 +264,81 @@ class TestElastic(TestCase):
 
         query_filter = {"term": {"name": "foo"}}
 
-        with self.app.app_context():
+        async with self.app.app_context():
             req = ParsedRequest()
             req.args = {"filter": json.dumps(query_filter)}
-            cursor, count = self.app.data.find("items_with_description", req, None)
+            cursor, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(1, count)
 
-        with self.app.app_context():
+        async with self.app.app_context():
             req = ParsedRequest()
             req.args = {"q": "bar", "filter": json.dumps(query_filter)}
-            cursor, count = self.app.data.find("items_with_description", req, None)
+            cursor, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(0, count)
 
-    def test_find_one_by_id(self):
+    async def test_find_one_by_id(self):
         """elastic 1.0+ is using 'found' property instead of 'exists'"""
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "test", config.ID_FIELD: "testid"}])
-            item = self.app.data.find_one(
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "test", config.ID_FIELD: "testid"}])
+            item = await self.app.data.find_one(
                 "items", req=None, **{config.ID_FIELD: "testid"}
             )
             self.assertEqual("testid", item[config.ID_FIELD])
 
-    def test_find_one_multiple_criteria(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_find_one_multiple_criteria(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items", [{"uri": "test", "name": "foo", config.ID_FIELD: "testid"}]
             )
-            item = self.app.data.find_one("items", req=None, name="foo", uri="test")
+            item = await self.app.data.find_one("items", req=None, name="foo", uri="test")
             self.assertEqual("testid", item[config.ID_FIELD])
 
-    def test_formating_fields(self):
+    async def test_formating_fields(self):
         """when using elastic 1.0+ it puts all requested fields values into a list
         so instead of {"name": "test"} it returns {"name": ["test"]}"""
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "test", "name": "test"}])
-            item = self.app.data.find_one("items", req=None, uri="test")
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "test", "name": "test"}])
+            item = await self.app.data.find_one("items", req=None, uri="test")
             self.assertEqual("test", item["name"])
 
-    def test_search_via_source_param(self):
+    async def test_search_via_source_param(self):
         query = {"query": {"term": {"uri": "foo"}}}
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo", "name": "foo"}])
-            self.app.data.insert("items", [{"uri": "bar", "name": "bar"}])
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo", "name": "foo"}])
+            await self.app.data.insert("items", [{"uri": "bar", "name": "bar"}])
             req = ParsedRequest()
             req.args = {"source": json.dumps(query)}
-            res, count = self.app.data.find("items", req, None)
+            res, count = await self.app.data.find("items", req, None)
             self.assertEqual(1, res.count())
 
-    def test_search_via_source_param_and_schema_filter(self):
+    async def test_search_via_source_param_and_schema_filter(self):
         query = {"query": {"term": {"uri": "foo"}}}
-        with self.app.app_context():
-            self.app.data.insert(
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo", "description": "test", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description", [{"uri": "bar", "name": "bar"}]
             )
             req = ParsedRequest()
             req.args = {"source": json.dumps(query)}
-            res, count = self.app.data.find("items_with_description", req, None)
+            res, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(1, res.count())
 
-    def test_search_via_source_param_and_with_highlight(self):
+    async def test_search_via_source_param_and_with_highlight(self):
         query = {"query": {"query_string": {"query": "foo"}}}
-        with self.app.app_context():
-            self.app.data.insert(
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo", "description": "This is foo", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description", [{"uri": "bar", "name": "bar"}]
             )
             req = ParsedRequest()
             req.args = {"source": json.dumps(query), "es_highlight": 1}
-            res, count = self.app.data.find("items_with_description", req, None)
+            res, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(1, res.count())
             es_highlight = res[0].get("es_highlight")
             self.assertIsNotNone(es_highlight)
@@ -344,41 +350,41 @@ class TestElastic(TestCase):
                 'This is <span class="es-highlight">foo</span>',
             )
 
-    def test_search_with_highlight_without_query_string_query(self):
-        with self.app.app_context():
+    async def test_search_with_highlight_without_query_string_query(self):
+        async with self.app.app_context():
             req = ParsedRequest()
             req.args = {
                 "source": json.dumps({"query": {"term": {"name": "foo"}}}),
                 "es_highlight": 1,
             }
-            res, count = self.app.data.find("items_with_description", req, None)
+            res, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(0, res.count())
 
-    def test_search_via_source_param_and_without_highlight(self):
+    async def test_search_via_source_param_and_without_highlight(self):
         query = {"query": {"query_string": {"query": "foo"}}}
-        with self.app.app_context():
-            self.app.data.insert(
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo", "description": "This is foo", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description", [{"uri": "bar", "name": "bar"}]
             )
             req = ParsedRequest()
             req.args = {"source": json.dumps(query), "es_highlight": 0}
-            res, count = self.app.data.find("items_with_description", req, None)
+            res, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(1, res.count())
             es_highlight = res[0].get("es_highlight")
             self.assertIsNone(es_highlight)
 
-    def test_search_via_source_param_and_with_source_projection(self):
+    async def test_search_via_source_param_and_with_source_projection(self):
         query = {"query": {"query_string": {"query": "foo"}}}
-        with self.app.app_context():
-            self.app.data.insert(
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo", "description": "This is foo", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description", [{"uri": "bar", "name": "bar"}]
             )
             req = ParsedRequest()
@@ -386,14 +392,14 @@ class TestElastic(TestCase):
                 "source": json.dumps(query),
                 "projections": json.dumps(["name"]),
             }
-            res, count = self.app.data.find("items_with_description", req, None)
+            res, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(1, res.count())
             self.assertTrue("description" not in res.docs[0])
             self.assertTrue("name" in res.docs[0])
             self.assertEqual("items_with_description", res.docs[0]["_type"])
 
-    def test_should_aggregate(self):
-        with self.app.app_context():
+    async def test_should_aggregate(self):
+        async with self.app.app_context():
             self.app.config["ELASTICSEARCH_AUTO_AGGREGATIONS"] = False
             req = ParsedRequest()
             req.args = {"aggregations": 1}
@@ -401,8 +407,8 @@ class TestElastic(TestCase):
             req.args = {"aggregations": "0"}
             self.assertFalse(self.app.data.should_aggregate(req))
 
-    def test_should_project(self):
-        with self.app.app_context():
+    async def test_should_project(self):
+        async with self.app.app_context():
             req = ParsedRequest()
             req.args = {
                 "projections": json.dumps(
@@ -415,8 +421,8 @@ class TestElastic(TestCase):
             req.args = {}
             self.assertFalse(self.app.data.should_project(req))
 
-    def test_get_projected_fields(self):
-        with self.app.app_context():
+    async def test_get_projected_fields(self):
+        async with self.app.app_context():
             req = ParsedRequest()
             req.args = {
                 "projections": json.dumps(
@@ -428,9 +434,9 @@ class TestElastic(TestCase):
                 fields, "priority,urgency,word_count,slugline,highlights,_resource"
             )
 
-    def test_eve_projection(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_eve_projection(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items",
                 [
                     {
@@ -451,7 +457,7 @@ class TestElastic(TestCase):
                 }
             )
 
-            items, count = self.app.data.find("items", req, None)
+            items, count = await self.app.data.find("items", req, None)
             fields = items[0].keys()
             self.assertIn("name", fields)
             self.assertIn("_id", fields)
@@ -460,74 +466,74 @@ class TestElastic(TestCase):
             self.assertIn("_updated", fields)
             self.assertNotIn("firstcreated", fields)
 
-    def test_should_highlight(self):
-        with self.app.app_context():
+    async def test_should_highlight(self):
+        async with self.app.app_context():
             req = ParsedRequest()
             req.args = {"es_highlight": 1}
             self.assertTrue(self.app.data.should_highlight(req))
             req.args = {"es_highlight": "0"}
             self.assertFalse(self.app.data.should_highlight(req))
 
-    def test_mapping_is_there_after_delete(self):
-        with self.app.app_context():
-            mapping = self.app.data.get_mapping(DOC_TYPE)
-            self.app.data.remove("items")
-            self.assertEqual(mapping, self.app.data.get_mapping(DOC_TYPE))
+    async def test_mapping_is_there_after_delete(self):
+        async with self.app.app_context():
+            mapping = await self.app.data.get_mapping(DOC_TYPE)
+            await self.app.data.remove("items")
+            self.assertEqual(mapping, await self.app.data.get_mapping(DOC_TYPE))
 
-    def test_find_one_raw(self):
-        with self.app.app_context():
-            ids = self.app.data.insert("items", [{"uri": "foo", "name": "foo"}])
-            item = self.app.data.find_one_raw("items", ids[0])
+    async def test_find_one_raw(self):
+        async with self.app.app_context():
+            ids = await self.app.data.insert("items", [{"uri": "foo", "name": "foo"}])
+            item = await self.app.data.find_one_raw("items", ids[0])
             self.assertEqual(item["name"], "foo")
 
-    def test_is_empty(self):
-        with self.app.app_context():
-            self.assertTrue(self.app.data.is_empty("items"))
-            self.app.data.insert("items", [{"uri": "foo"}])
-            self.assertFalse(self.app.data.is_empty("items"))
+    async def test_is_empty(self):
+        async with self.app.app_context():
+            self.assertTrue(await self.app.data.is_empty("items"))
+            await self.app.data.insert("items", [{"uri": "foo"}])
+            self.assertFalse(await self.app.data.is_empty("items"))
 
-    def test_replace(self):
-        with self.app.app_context():
-            res = self.app.data.insert("items", [{"uri": "foo"}])
+    async def test_replace(self):
+        async with self.app.app_context():
+            res = await self.app.data.insert("items", [{"uri": "foo"}])
             self.assertEqual(1, len(res))
             new_item = {"uri": "bar"}
-            res = self.app.data.replace("items", res.pop(), new_item)
+            res = await self.app.data.replace("items", res.pop(), new_item)
             self.assertEqual(2, res["_version"])
 
-    def test_sub_resource_lookup(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo", "name": "foo"}])
+    async def test_sub_resource_lookup(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo", "name": "foo"}])
             req = ParsedRequest()
             req.args = {}
-            cursor, count = self.app.data.find("items", req, {"name": "foo"})
+            cursor, count = await self.app.data.find("items", req, {"name": "foo"})
             self.assertEqual(1, count)
-            cursor, count = self.app.data.find("items", req, {"name": "bar"})
+            cursor, count = await self.app.data.find("items", req, {"name": "bar"})
             self.assertEqual(0, count)
-            cursor, count = self.app.data.find(
+            cursor, count = await self.app.data.find(
                 "items", req, {"name": "foo", "uri": "foo"}
             )
             self.assertEqual(1, count)
 
-    def test_sub_resource_lookup_with_schema_filter(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_sub_resource_lookup_with_schema_filter(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo", "description": "test", "name": "foo"}],
             )
             req = ParsedRequest()
             req.args = {}
-            cursor, count = self.app.data.find(
+            cursor, count = await self.app.data.find(
                 "items_with_description", req, {"name": "foo"}
             )
             self.assertEqual(1, count)
-            cursor, count = self.app.data.find(
+            cursor, count = await self.app.data.find(
                 "items_with_description", req, {"name": "bar"}
             )
             self.assertEqual(0, count)
 
-    def test_resource_filter(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_resource_filter(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo", "description": "test"}, {"uri": "bar"}],
             )
@@ -536,79 +542,81 @@ class TestElastic(TestCase):
             req.args["source"] = json.dumps(
                 {"query": {"bool": {"must": [{"term": {"uri": "bar"}}]}}}
             )
-            cursor, count = self.app.data.find("items_with_description", req, None)
+            cursor, count = await self.app.data.find("items_with_description", req, None)
             self.assertEqual(0, count)
 
-    def test_where_filter(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_where_filter(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items", [{"uri": "foo", "name": "foo"}, {"uri": "bar", "name": "bar"}]
             )
 
-        with self.app.test_client() as c:
-            response = c.get('items?where={"name":"foo"}')
-            data = json.loads(response.data)
+        async with self.app.test_client() as c:
+            response = await c.get('items?where={"name":"foo"}')
+            raw_data = await response.get_data()
+            print(raw_data)
+            data = json.loads(raw_data)
             self.assertEqual(1, len(data["_items"]))
 
-            response = c.get('items?where=name=="foo"')
-            data = json.loads(response.data)
+            response = await c.get('items?where=name=="foo"')
+            data = json.loads(await response.get_data())
             self.assertEqual(1, len(data["_items"]))
 
-    def test_update(self):
-        with self.app.app_context():
-            ids = self.app.data.insert("items", [{"uri": "foo"}])
-            self.app.data.update(
+    async def test_update(self):
+        async with self.app.app_context():
+            ids = await self.app.data.insert("items", [{"uri": "foo"}])
+            await self.app.data.update(
                 "items", ids[0], {"uri": "bar", "_id": ids[0], "_type": "items"}
             )
             self.assertEqual(
-                self.app.data.find_one("items", req=None, _id=ids[0])["uri"], "bar"
+                (await self.app.data.find_one("items", req=None, _id=ids[0]))["uri"], "bar"
             )
 
-    def test_remove_by_id(self):
-        with self.app.app_context():
-            self.ids = self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
-            self.app.data.remove("items", {"_id": self.ids[0]})
+    async def test_remove_by_id(self):
+        async with self.app.app_context():
+            self.ids = await self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
+            await self.app.data.remove("items", {"_id": self.ids[0]})
             req = ParsedRequest()
             req.args = {}
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(1, count)
 
-    def test_remove_non_existing_item(self):
-        with self.app.app_context():
-            self.assertEqual(self.app.data.remove("items", {"_id": "notfound"}), None)
+    async def test_remove_non_existing_item(self):
+        async with self.app.app_context():
+            self.assertEqual(await self.app.data.remove("items", {"_id": "notfound"}), None)
 
-    @raises(elasticsearch.exceptions.ConnectionError)
-    def test_it_can_use_configured_url(self):
-        with self.app.app_context():
-            self.app.config["ELASTICSEARCH_URL"] = "http://localhost:9292"
-            elastic = Elastic(self.app)
-            elastic.init_index()
+    async def test_it_can_use_configured_url(self):
+        async with self.app.app_context():
+            with raises(elasticsearch.exceptions.ConnectionError):
+                self.app.config["ELASTICSEARCH_URL"] = "http://localhost:9292"
+                elastic = Elastic(self.app)
+                await elastic.init_index()
 
-    def test_resource_aggregates(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_resource_aggregates(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo1", "description": "test", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo2", "description": "test1", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "foo3", "description": "test2", "name": "foo"}],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 "items_with_description",
                 [{"uri": "bar1", "description": "test3", "name": "bar"}],
             )
             req = ParsedRequest()
             req.args = {}
             response = {}
-            item1, count1 = self.app.data.find(
+            item1, count1 = await self.app.data.find(
                 "items_with_description", req, {"name": "foo"}
             )
-            item2, count2 = self.app.data.find(
+            item2, count2 = await self.app.data.find(
                 "items_with_description", req, {"name": "bar"}
             )
             item1.extra(response)
@@ -618,43 +626,43 @@ class TestElastic(TestCase):
                 3, response["_aggregations"]["type"]["buckets"][0]["doc_count"]
             )
 
-    def test_resource_aggregates_no_auto(self):
-        with self.app.app_context():
-            self.app.data.insert("items_with_description", [{"uri": "foo"}])
+    async def test_resource_aggregates_no_auto(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items_with_description", [{"uri": "foo"}])
             self.app.config["ELASTICSEARCH_AUTO_AGGREGATIONS"] = False
             req = ParsedRequest()
             req.args = {}
             response = {}
-            cursor, count = self.app.data.find("items_with_description", req, {})
+            cursor, count = await self.app.data.find("items_with_description", req, {})
             cursor.extra(response)
             self.assertNotIn("_aggregations", response)
 
             req.args = {"aggregations": 1}
-            cursor, count = self.app.data.find("items_with_description", req, {})
+            cursor, count = await self.app.data.find("items_with_description", req, {})
             cursor.extra(response)
             self.assertIn("_aggregations", response)
 
-    def test_put(self):
-        with self.app.app_context():
-            self.app.data.replace(
+    async def test_put(self):
+        async with self.app.app_context():
+            await self.app.data.replace(
                 "items", "newid", {"uri": "foo", "_id": "newid", "_type": "x"}
             )
             self.assertEqual(
-                "foo", self.app.data.find_one("items", None, _id="newid")["uri"]
+                "foo", (await self.app.data.find_one("items", None, _id="newid"))["uri"]
             )
 
-    def test_args_filter(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
+    async def test_args_filter(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
             req = ParsedRequest()
             req.args = {}
             req.args["filter"] = json.dumps({"term": {"uri": "foo"}})
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(1, count)
 
-    def test_filters_with_aggregations(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_filters_with_aggregations(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_description",
                 [
                     {"uri": "foo", "name": "test", "description": "a"},
@@ -664,7 +672,7 @@ class TestElastic(TestCase):
 
             req = ParsedRequest()
             res = {}
-            cursor, count = self.app.data.find(
+            cursor, count = await self.app.data.find(
                 "items_with_description", req, {"uri": "bar"}
             )
             cursor.extra(res)
@@ -674,18 +682,18 @@ class TestElastic(TestCase):
             )
             self.assertEqual(1, res["_aggregations"]["type"]["buckets"][0]["doc_count"])
 
-    def test_filter_without_args(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
+    async def test_filter_without_args(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
             req = ParsedRequest()
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(2, count)
-            cursor, count = self.app.data.find("items", req, {"uri": "foo"})
+            cursor, count = await self.app.data.find("items", req, {"uri": "foo"})
             self.assertEqual(1, count)
 
-    def test_filters_with_filtered_query(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_filters_with_filtered_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items", [{"uri": "foo"}, {"uri": "bar"}, {"uri": "baz"}]
             )
 
@@ -699,72 +707,72 @@ class TestElastic(TestCase):
 
             req = ParsedRequest()
             req.args = {"source": json.dumps(query)}
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(0, cursor.count())
 
-    def test_basic_search_query(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
+    async def test_basic_search_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo"}, {"uri": "bar"}])
 
-        with self.app.test_request_context("/items/?q=foo"):
+        async with self.app.test_request_context("/items/?q=foo"):
             req = parse_request("items")
-            cursor, count = self.app.data.find("items", req, None)
-            self.assertEquals(1, cursor.count())
+            cursor, count = await self.app.data.find("items", req, None)
+            self.assertEqual(1, cursor.count())
 
-    def test_phrase_search_query(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo bar"}, {"uri": "some text"}])
+    async def test_phrase_search_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo bar"}, {"uri": "some text"}])
 
-        with self.app.test_request_context('/items/?q="foo bar"'):
+        async with self.app.test_request_context('/items/?q="foo bar"'):
             req = parse_request("items")
-            cursor, count = self.app.data.find("items", req, None)
-            self.assertEquals(1, cursor.count())
+            cursor, count = await self.app.data.find("items", req, None)
+            self.assertEqual(1, cursor.count())
 
-        with self.app.test_request_context('/items/?q="bar foo"'):
+        async with self.app.test_request_context('/items/?q="bar foo"'):
             req = parse_request("items")
-            cursor, count = self.app.data.find("items", req, None)
-            self.assertEquals(0, cursor.count())
+            cursor, count = await self.app.data.find("items", req, None)
+            self.assertEqual(0, cursor.count())
 
-    def test_elastic_filter_callback(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_elastic_filter_callback(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items_with_callback_filter", [{"uri": "foo"}, {"uri": "bar"}]
             )
 
-        with self.app.test_request_context("test?uri=foo"):
+        async with self.app.test_request_context("test?uri=foo"):
             req = parse_request("items_with_callback_filter")
-            cursor, count = self.app.data.find("items_with_callback_filter", req, None)
+            cursor, count = await self.app.data.find("items_with_callback_filter", req, None)
             self.assertEqual(1, cursor.count())
 
-    def test_elastic_sort_by_score_if_there_is_query(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_elastic_sort_by_score_if_there_is_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 "items",
                 [{"uri": "foo", "name": "foo bar"}, {"uri": "bar", "name": "foo bar"}],
             )
 
-        with self.app.test_request_context("/items/"):
+        async with self.app.test_request_context("/items/"):
             req = parse_request("items")
             req.args = {"q": "foo"}
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(2, cursor.count())
             self.assertEqual("foo", cursor[0]["uri"])
 
-    def test_elastic_find_default_sort_no_mapping(self):
-        with self.app.test_request_context("/items/"):
+    async def test_elastic_find_default_sort_no_mapping(self):
+        async with self.app.test_request_context("/items/"):
             req = parse_request("items")
             req.args = {}
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(0, cursor.count())
 
     @skip("every resource has it's own index now")
-    def test_custom_index_settings_per_resource(self):
+    async def test_custom_index_settings_per_resource(self):
         archived_index = "elastic_test_archived"
         archived_type = "archived_items"
 
-        self.app.data.drop_index()
+        await self.app.data.drop_index()
 
-        with self.app.app_context():
+        async with self.app.app_context():
             self.app.config["ELASTICSEARCH_INDEXES"] = {archived_type: archived_index}
             self.assertIn(archived_type, self.app.config["SOURCES"])
 
@@ -772,58 +780,58 @@ class TestElastic(TestCase):
 
         self.app.data = Elastic(self.app)
         self.app.data.init_app(self.app)
-        with self.app.app_context():
-            self.app.data.init_index()
+        async with self.app.app_context():
+            await self.app.data.init_index()
 
         self.assertTrue(self.es.indices.exists(archived_index))
-        self.assertEqual(0, self.es.count(archived_index, archived_type)["count"])
+        self.assertEqual(0, await self.es.count(index=archived_index, doc_type=archived_type)["count"])
 
-        with self.app.app_context():
-            self.app.data.insert(
+        async with self.app.app_context():
+            await self.app.data.insert(
                 archived_type, [{"name": "foo", "archived": "2013-01-01T11:12:13+0000"}]
             )
 
-        self.assertEqual(1, self.es.count(archived_index, archived_type)["count"])
+        self.assertEqual(1, await self.es.count(index=archived_index, doc_type=archived_type)["count"])
 
-        with self.app.app_context():
-            item = self.app.data.find_one(archived_type, req=None, name="foo")
+        async with self.app.app_context():
+            item = await self.app.data.find_one(archived_type, req=None, name="foo")
             self.assertEqual("foo", item["name"])
 
-    def test_no_force_refresh(self):
-        with self.app.app_context():
+    async def test_no_force_refresh(self):
+        async with self.app.app_context():
             self.app.config["ELASTICSEARCH_FORCE_REFRESH"] = False
-            ids = self.app.data.insert(
+            ids = await self.app.data.insert(
                 "items", [{"uri": "foo", "name": "foo"}, {"uri": "bar", "name": "bar"}]
             )
 
-            item = self.app.data.find_one("items", req=None, _id=ids[0])
+            item = await self.app.data.find_one("items", req=None, _id=ids[0])
             self.assertEqual("foo", item["uri"])
 
             time.sleep(2)
             req = ParsedRequest()
-            cursor, count = self.app.data.find("items", req, None)
+            cursor, count = await self.app.data.find("items", req, None)
             self.assertEqual(2, cursor.count())
 
-    def test_elastic_prefix(self):
-        with self.app.app_context():
-            mapping = self.app.data.get_mapping("items_foo")["mappings"]["properties"]
+    async def test_elastic_prefix(self):
+        async with self.app.app_context():
+            mapping = (await self.app.data.get_mapping("items_foo"))["mappings"]["properties"]
             self.assertIn("firstcreated", mapping)
 
-            self.app.data.insert("items_foo_default_index", [{"uri": "test"}])
-            foo_items, count = self.app.data.find("items_foo", ParsedRequest(), None)
+            await self.app.data.insert("items_foo_default_index", [{"uri": "test"}])
+            foo_items, count = await self.app.data.find("items_foo", ParsedRequest(), None)
             self.assertEqual(0, foo_items.count())
 
-            self.app.data.insert("items_foo", [{"uri": "foo"}, {"uri": "bar"}])
-            foo_items, count = self.app.data.find("items_foo", ParsedRequest(), None)
+            await self.app.data.insert("items_foo", [{"uri": "foo"}, {"uri": "bar"}])
+            foo_items, count = await self.app.data.find("items_foo", ParsedRequest(), None)
             self.assertEqual(2, foo_items.count())
 
-    def test_retry_on_conflict(self):
-        with self.app.app_context():
+    async def test_retry_on_conflict(self):
+        async with self.app.app_context():
             original_method = self.app.data.elastic("items").update
-            update_mock = MagicMock()
+            update_mock = AsyncMock()
             self.app.data.elastic("items").update = update_mock
 
-            self.app.data.update(
+            await self.app.data.update(
                 "items", "foo", {"uri": "bar", "_id": "foo", "_type": "items"}
             )
             self.assertEqual(update_mock.call_count, 1)
@@ -831,7 +839,7 @@ class TestElastic(TestCase):
             self.assertEqual(update_mock.call_args[1]["retry_on_conflict"], 5)
 
             self.app.config["ELASTICSEARCH_RETRY_ON_CONFLICT"] = 1
-            self.app.data.update(
+            await self.app.data.update(
                 "items", "foo", {"uri": "bar", "_id": "foo", "_type": "items"}
             )
             self.assertEqual(update_mock.call_count, 2)
@@ -839,25 +847,25 @@ class TestElastic(TestCase):
             self.assertEqual(update_mock.call_args[1]["retry_on_conflict"], 1)
 
             self.app.config["ELASTICSEARCH_RETRY_ON_CONFLICT"] = None
-            self.app.data.update(
+            await self.app.data.update(
                 "items", "foo", {"uri": "bar", "_id": "foo", "_type": "items"}
             )
             self.assertEqual(update_mock.call_count, 3)
             self.assertNotIn("retry_on_conflict", update_mock.call_args[1])
             self.app.data.elastic("items").update = original_method
 
-    def test_search_multiple_resource(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo", "name": "item"}])
-            self.app.data.insert("archived_items", [{"name": "archived"}])
-            self.app.data.insert("items_foo", [{"name": "foo"}])
+    async def test_search_multiple_resource(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo", "name": "item"}])
+            await self.app.data.insert("archived_items", [{"name": "archived"}])
+            await self.app.data.insert("items_foo", [{"name": "foo"}])
 
-            docs = self.app.data.search({}, "items,archived_items")
+            docs = await self.app.data.search({}, "items,archived_items")
             self.assertEqual(2, docs.count())
 
-    def test_bulk_insert_with_version(self):
-        with self.app.app_context():
-            self.app.data.bulk_insert(
+    async def test_bulk_insert_with_version(self):
+        async with self.app.app_context():
+            await self.app.data.bulk_insert(
                 "items",
                 [
                     {"uri": "foo", "name": "item1", "version": 1},
@@ -865,13 +873,13 @@ class TestElastic(TestCase):
                 ],
             )
 
-            item1 = self.app.data.find_one("items", req=None, _id="bar")
+            item1 = await self.app.data.find_one("items", req=None, _id="bar")
             self.assertIsNotNone(item1)
 
-    def test_filtered_query(self):
-        with self.app.app_context():
-            self.app.data.insert("items", [{"uri": "foo", "name": "item"}])
-            docs = self.app.data.search(
+    async def test_filtered_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", [{"uri": "foo", "name": "item"}])
+            docs = await self.app.data.search(
                 {
                     "query": {
                         "filtered": {
@@ -885,10 +893,10 @@ class TestElastic(TestCase):
             self.assertEqual(1, docs.count())
 
 
-class TestElasticSearchWithSettings(TestCase):
+class TestElasticSearchWithSettings(IsolatedAsyncioTestCase):
     resource = "items"
 
-    def setUp(self):
+    async def asyncSetUp(self):
         settings = {
             "DOMAIN": {
                 self.resource: {
@@ -913,13 +921,18 @@ class TestElasticSearchWithSettings(TestCase):
         }
 
         self.app = eve.Eve(settings=settings, data=Elastic)
-        with self.app.app_context():
+        await self.app.init_resources()
+        async with self.app.app_context():
             self.app.init_app(self.app)
-            self.app.data.init_index()
+            await self.app.data.init_index()
 
-    def test_elastic_settings(self):
-        with self.app.app_context():
-            settings = self.app.data.get_settings(self.resource)
+    async def asyncTearDown(self):
+        await self.app.data.destroy_app()
+        del self.app
+
+    async def test_elastic_settings(self):
+        async with self.app.app_context():
+            settings = await self.app.data.get_settings(self.resource)
             analyzer = settings["settings"]["index"]["analysis"]["analyzer"]
             self.assertDictEqual(
                 {
@@ -932,9 +945,9 @@ class TestElasticSearchWithSettings(TestCase):
                 analyzer,
             )
 
-    def test_put_settings(self):
-        with self.app.app_context():
-            settings = self.app.data.get_settings(self.resource)
+    async def test_put_settings(self):
+        async with self.app.app_context():
+            settings = await self.app.data.get_settings(self.resource)
             analyzer = settings["settings"]["index"]["analysis"]["analyzer"]
             self.assertDictEqual(
                 {
@@ -953,8 +966,8 @@ class TestElasticSearchWithSettings(TestCase):
                 "phrase_prefix_analyzer"
             ] = {"type": "custom", "tokenizer": "whitespace", "filter": ["uppercase"]}
 
-            self.app.data.put_settings(self.resource, new_settings)
-            settings = self.app.data.get_settings(self.resource)
+            await self.app.data.put_settings(self.resource, new_settings)
+            settings = await self.app.data.get_settings(self.resource)
             analyzer = settings["settings"]["index"]["analysis"]["analyzer"]
             self.assertDictEqual(
                 {
@@ -967,16 +980,16 @@ class TestElasticSearchWithSettings(TestCase):
                 analyzer,
             )
 
-    def test_put_settings_with_no_changes_existing_settings(self):
-        with self.app.app_context():
+    async def test_put_settings_with_no_changes_existing_settings(self):
+        async with self.app.app_context():
             with patch.object(
                 self.app.data.es.indices, "close", side_effect=KeyError
             ) as indices_close:
-                self.app.data.put_settings(self.resource, ELASTICSEARCH_SETTINGS)
+                await self.app.data.put_settings(self.resource, ELASTICSEARCH_SETTINGS)
             indices_close.assert_not_called()
 
-    def test_put_settings_existing_index(self):
-        with self.app.app_context():
+    async def test_put_settings_existing_index(self):
+        async with self.app.app_context():
             self.app.config["DOMAIN"] = deepcopy(self.app.config["DOMAIN"])
             self.app.config["DOMAIN"]["items"]["schema"]["slugline"] = {
                 "type": "string",
@@ -995,7 +1008,7 @@ class TestElasticSearchWithSettings(TestCase):
             self.app.config["ELASTICSEARCH_SETTINGS"] = new_settings
 
             with self.assertLogs("elastic") as log:
-                self.app.data.init_index()
+                await self.app.data.init_index()
                 self.assertIn(
                     "ERROR:elastic:mapping error, updating settings resource=items",
                     log.output[0],
@@ -1014,7 +1027,7 @@ class TestElasticSearchWithSettings(TestCase):
 
 
 @skip("no parent/child join between indexes")
-class TestElasticSearchParentChild(TestCase):
+class TestElasticSearchParentChild(IsolatedAsyncioTestCase):
     index_name = "elastic_index"
     parent_item = "items"
     child_item = "child_items"
@@ -1038,7 +1051,7 @@ class TestElasticSearchParentChild(TestCase):
         },
     }
 
-    def setUp(self):
+    async def asyncSetUp(self):
         settings = {
             "DOMAIN": self.domain,
             "ELASTICSEARCH_URL": "http://localhost:9200",
@@ -1047,22 +1060,28 @@ class TestElasticSearchParentChild(TestCase):
         }
 
         self.app = eve.Eve(settings=settings, data=Elastic)
-        with self.app.app_context():
-            self.app.data.init_index()
+        await self.app.init_resources()
+        async with self.app.app_context():
+            await self.app.data.init_index()
             for resource in self.app.config["DOMAIN"]:
                 self.app.data.remove(resource)
 
             self.es = get_es(self.app.config.get("ELASTICSEARCH_URL"))
-            self.checkVersion()
+            await self.checkVersion()
 
-    def checkVersion(self):
-        with self.app.app_context():
-            info = self.es.info()
+    async def asyncTearDown(self):
+        await self.es.close()
+        await self.app.data.destroy_app()
+        del self.app
+
+    async def checkVersion(self):
+        async with self.app.app_context():
+            info = await self.es.info()
             self.version_2x = info.get("version", {}).get("number", "").startswith("2")
 
-    def test_child_items_mapping(self):
-        with self.app.app_context():
-            mapping = self.es.indices.get_mapping(
+    async def test_child_items_mapping(self):
+        async with self.app.app_context():
+            mapping = await self.es.indices.get_mapping(
                 index=self.index_name, doc_type="child_items"
             )
             for value in mapping.values():
@@ -1076,12 +1095,12 @@ class TestElasticSearchParentChild(TestCase):
                     {"required": True},
                 )
 
-    def test_insert_child_item(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_insert_child_item(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.parent_item, [{"_id": "foo", "name": "foo", "headline": "test"}]
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1093,10 +1112,10 @@ class TestElasticSearchParentChild(TestCase):
                 ],
             )
 
-            parent = self.app.data.find_one(self.parent_item, req=None, _id="foo")
+            parent = await self.app.data.find_one(self.parent_item, req=None, _id="foo")
             self.assertEqual(parent["_id"], "foo")
             self.assertEqual(parent["name"], "foo")
-            child = self.app.data.find_one(
+            child = await self.app.data.find_one(
                 self.child_item, req=None, _id="childfoo", parent="foo"
             )
             self.assertEqual(child["_id"], "childfoo")
@@ -1104,14 +1123,14 @@ class TestElasticSearchParentChild(TestCase):
             self.assertEqual(child["item_id"], "foo")
 
             # without parent
-            child = self.app.data.find_one(self.child_item, req=None, _id="childfoo")
+            child = await self.app.data.find_one(self.child_item, req=None, _id="childfoo")
             self.assertEqual(child["_id"], "childfoo")
             self.assertEqual(child["name"], "childfoo")
             self.assertEqual(child["item_id"], "foo")
 
-    def test_insert_child_item_with_no_parent(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_insert_child_item_with_no_parent(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1123,19 +1142,19 @@ class TestElasticSearchParentChild(TestCase):
                 ],
             )
 
-            child = self.app.data.find_one(
+            child = await self.app.data.find_one(
                 self.child_item, req=None, _id="childfoo", parent="test"
             )
             self.assertEqual(child["_id"], "childfoo")
             self.assertEqual(child["name"], "childfoo")
             self.assertEqual(child["item_id"], "test")
 
-    def test_update_child_item(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_update_child_item(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.parent_item, [{"_id": "foo", "name": "foo", "headline": "test"}]
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1147,7 +1166,7 @@ class TestElasticSearchParentChild(TestCase):
                 ],
             )
 
-            child = self.app.data.find_one(
+            child = await self.app.data.find_one(
                 self.child_item, req=None, _id="childfoo", parent="foo"
             )
 
@@ -1156,7 +1175,7 @@ class TestElasticSearchParentChild(TestCase):
             self.assertEqual(child["item_id"], "foo")
             self.assertEqual(child["headline"], "test")
 
-            self.app.data.update(
+            await self.app.data.update(
                 self.child_item,
                 id_="childfoo",
                 updates={
@@ -1167,7 +1186,7 @@ class TestElasticSearchParentChild(TestCase):
                 },
             )
 
-            child = self.app.data.find_one(
+            child = await self.app.data.find_one(
                 self.child_item, req=None, _id="childfoo", parent="foo"
             )
             self.assertEqual(child["_id"], "childfoo")
@@ -1175,12 +1194,12 @@ class TestElasticSearchParentChild(TestCase):
             self.assertEqual(child["item_id"], "foo")
             self.assertEqual(child["headline"], "test test")
 
-    def test_update_child_item_with_no_parent_raises_exception(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_update_child_item_with_no_parent_raises_exception(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.parent_item, [{"_id": "foo", "name": "foo", "headline": "test"}]
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1193,7 +1212,7 @@ class TestElasticSearchParentChild(TestCase):
             )
 
             with self.assertRaises(elasticsearch.TransportError) as cm:
-                self.app.data.update(
+                await self.app.data.update(
                     self.child_item,
                     id_="childfoo",
                     updates={
@@ -1209,12 +1228,12 @@ class TestElasticSearchParentChild(TestCase):
             else:
                 self.assertIn("RoutingMissingException", cm.exception.error)
 
-    def test_update_child_item_and_change_parent_raises_exception(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_update_child_item_and_change_parent_raises_exception(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.parent_item, [{"_id": "foo", "name": "foo", "headline": "test"}]
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1227,7 +1246,7 @@ class TestElasticSearchParentChild(TestCase):
             )
 
             with self.assertRaises(elasticsearch.TransportError) as cm:
-                self.app.data.update(
+                await self.app.data.update(
                     self.child_item,
                     id_="childfoo",
                     updates={
@@ -1244,9 +1263,9 @@ class TestElasticSearchParentChild(TestCase):
             else:
                 self.assertIn("DocumentMissingException", cm.exception.error)
 
-    def test_bulk_insert_child_items(self):
-        with self.app.app_context():
-            (count, _errors) = self.app.data.bulk_insert(
+    async def test_bulk_insert_child_items(self):
+        async with self.app.app_context():
+            (count, _errors) = await self.app.data.bulk_insert(
                 self.child_item,
                 [
                     {"_id": "u1", "name": "foo", "item_id": "item1"},
@@ -1254,28 +1273,28 @@ class TestElasticSearchParentChild(TestCase):
                     {"_id": "u3", "name": "foo", "item_id": "item3"},
                 ],
             )
-            self.assertEquals(3, count)
-            self.assertEquals(0, len(_errors))
+            self.assertEqual(3, count)
+            self.assertEqual(0, len(_errors))
 
-    def test_replace_child_item(self):
-        with self.app.app_context():
-            res = self.app.data.insert(
+    async def test_replace_child_item(self):
+        async with self.app.app_context():
+            res = await self.app.data.insert(
                 self.child_item, [{"_id": "foo", "name": "testing", "item_id": "test"}]
             )
             self.assertEqual(1, len(res))
             new_item = {"name": "bar", "item_id": "test"}
-            res = self.app.data.replace(self.child_item, "foo", new_item)
+            res = await self.app.data.replace(self.child_item, "foo", new_item)
             self.assertEqual(2, res["_version"])
 
-    def test_replace_child_item_with_no_parent_raises_exception(self):
-        with self.app.app_context():
-            res = self.app.data.insert(
+    async def test_replace_child_item_with_no_parent_raises_exception(self):
+        async with self.app.app_context():
+            res = await self.app.data.insert(
                 self.child_item, [{"_id": "foo", "name": "testing", "item_id": "test"}]
             )
             self.assertEqual(1, len(res))
             with self.assertRaises(elasticsearch.TransportError) as cm:
                 new_item = {"name": "bar"}
-                res = self.app.data.replace(self.child_item, "foo", new_item)
+                res = await self.app.data.replace(self.child_item, "foo", new_item)
 
             self.assertEqual(cm.exception.status_code, 400)
             if self.version_2x:
@@ -1283,16 +1302,16 @@ class TestElasticSearchParentChild(TestCase):
             else:
                 self.assertIn("RoutingMissingException", cm.exception.error)
 
-    def test_parent_child_query(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_parent_child_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.parent_item,
                 [
                     {"_id": "foo", "name": "foo", "headline": "test"},
                     {"_id": "bar", "name": "bar", "headline": "test"},
                 ],
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1324,17 +1343,17 @@ class TestElasticSearchParentChild(TestCase):
             }
             req = ParsedRequest()
             req.args = {"source": json.dumps(query)}
-            results, count = self.app.data.find(self.parent_item, req, None)
+            results, count = await self.app.data.find(self.parent_item, req, None)
             self.assertEqual(1, results.count())
             self.assertEqual(results[0].get("_id"), "foo")
             self.assertEqual(results[0].get("_type"), self.parent_item)
 
-    def test_remove_child(self):
-        with self.app.app_context():
-            self.app.data.insert(
+    async def test_remove_child(self):
+        async with self.app.app_context():
+            await self.app.data.insert(
                 self.parent_item, [{"_id": "foo", "name": "foo", "headline": "test"}]
             )
-            self.app.data.insert(
+            await self.app.data.insert(
                 self.child_item,
                 [
                     {
@@ -1346,13 +1365,13 @@ class TestElasticSearchParentChild(TestCase):
                 ],
             )
             self.app.data.remove(self.child_item, {"_id": "childfoo"}, "foo")
-            child = self.app.data.find_one(
+            child = await self.app.data.find_one(
                 self.child_item, req=None, _id="childfoo", parent="foo"
             )
             self.assertIsNone(child)
 
 
-class TestElasticInnerHits(TestCase):
+class TestElasticInnerHits(IsolatedAsyncioTestCase):
     index_name = "elastic_innerhits"
     data = [
         {
@@ -1389,7 +1408,7 @@ class TestElasticInnerHits(TestCase):
         }
     }
 
-    def setUp(self):
+    async def asyncSetUp(self):
         settings = {
             "DOMAIN": self.domain,
             "ELASTICSEARCH_URL": "http://localhost:9200",
@@ -1398,14 +1417,20 @@ class TestElasticInnerHits(TestCase):
         }
 
         self.app = eve.Eve(settings=settings, data=Elastic)
-        with self.app.app_context():
-            self.app.data.drop_index()
-            self.app.data.init_index()
+        await self.app.init_resources()
+        async with self.app.app_context():
+            await self.app.data.drop_index()
+            await self.app.data.init_index()
             self.es = get_es(self.app.config.get("ELASTICSEARCH_URL"))
 
-    def test_inner_hits_query(self):
-        with self.app.app_context():
-            self.app.data.insert("items", self.data)
+    async def asyncTearDown(self):
+        await self.es.close()
+        await self.app.data.destroy_app()
+        del self.app
+
+    async def test_inner_hits_query(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", self.data)
             query = {
                 "query": {
                     "bool": {
@@ -1427,7 +1452,7 @@ class TestElasticInnerHits(TestCase):
             }
             req = ParsedRequest()
             req.args = {"source": json.dumps(query)}
-            results, count = self.app.data.find("items", req, None)
+            results, count = await self.app.data.find("items", req, None)
             self.assertEqual(2, results.count())
             self.assertEqual(results[0].get("_id"), "foo")
             self.assertEqual(len(results[0].get("_inner_hits")), 1)
@@ -1436,7 +1461,7 @@ class TestElasticInnerHits(TestCase):
             self.assertEqual(results[1].get("_inner_hits")["service"][0]["code"], "a")
 
 
-class TestElasticNested(TestCase):
+class TestElasticNested(IsolatedAsyncioTestCase):
     index_name = "elastic_nested"
     data = [
         {
@@ -1478,7 +1503,7 @@ class TestElasticNested(TestCase):
         }
     }
 
-    def setUp(self):
+    async def asyncSetUp(self):
         settings = {
             "DOMAIN": self.domain,
             "ELASTICSEARCH_URL": "http://localhost:9200",
@@ -1487,14 +1512,20 @@ class TestElasticNested(TestCase):
         }
 
         self.app = eve.Eve(settings=settings, data=Elastic)
-        with self.app.app_context():
-            self.app.data.drop_index()
-            self.app.data.init_index()
+        await self.app.init_resources()
+        async with self.app.app_context():
+            await self.app.data.drop_index()
+            await self.app.data.init_index()
             self.es = get_es(self.app.config.get("ELASTICSEARCH_URL"))
 
-    def test_nested_sort(self):
-        with self.app.app_context():
-            self.app.data.insert("items", self.data)
+    async def asyncTearDown(self):
+        await self.es.close()
+        await self.app.data.destroy_app()
+        del self.app
+
+    async def test_nested_sort(self):
+        async with self.app.app_context():
+            await self.app.data.insert("items", self.data)
             query = {
                 "query": {
                     "bool": {
@@ -1540,7 +1571,7 @@ class TestElasticNested(TestCase):
             }
             req = ParsedRequest()
             req.args = {"source": json.dumps(query)}
-            results, count = self.app.data.find("items", req, None)
+            results, count = await self.app.data.find("items", req, None)
             self.assertEqual(2, results.count())
             self.assertEqual(results[0].get("_id"), "bar")
             self.assertEqual(results[1].get("_id"), "foo")

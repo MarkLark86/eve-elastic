@@ -9,6 +9,6 @@ from .elastic import (
     get_es,
     get_indices,
     InvalidSearchString,
-    reindex,
+    async_reindex,
 )
 from .validation import Validator
